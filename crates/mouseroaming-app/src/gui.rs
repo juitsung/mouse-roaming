@@ -1,8 +1,8 @@
 use crate::os_icons::{paint_mini_os_icon, paint_os_window_icon, DeviceIconStyle, OsIconAssets};
 use crate::tray::{AppTray, TrayAction};
 use eframe::egui::{
-    self, Align2, Color32, CursorIcon, FontData, FontDefinitions, FontFamily, FontId, Id, LayerId,
-    Order, Pos2, Rect, RichText, Rounding, Sense, Stroke, Vec2,
+    self, Align2, Color32, ColorImage, CursorIcon, FontData, FontDefinitions, FontFamily, FontId, Id,
+    LayerId, Order, Pos2, Rect, RichText, Rounding, Sense, Stroke, TextureHandle, Vec2,
 };
 use mouseroaming_core::{
     AppConfig, AppRole, ConnectionTransportMode, ConnectedPeerInfo, EngineCommand, EngineHandle,
@@ -45,6 +45,7 @@ enum DropTarget {
 pub struct MouseRoamingGui {
     engine: EngineHandle,
     tray: Option<AppTray>,
+    app_logo: TextureHandle,
     os_icons: OsIconAssets,
     active_tab: Tab,
     discovery_mode: DiscoveryMode,
@@ -65,6 +66,17 @@ impl MouseRoamingGui {
         configure_fonts(&cc.egui_ctx);
         configure_style(&cc.egui_ctx);
 
+        let logo_data =
+            eframe::icon_data::from_png_bytes(include_bytes!("../../../assets/icon.png"))
+                .expect("Valid assets/icon.png");
+        let logo_image = ColorImage::from_rgba_unmultiplied(
+            [logo_data.width as usize, logo_data.height as usize],
+            &logo_data.rgba,
+        );
+        let app_logo =
+            cc.egui_ctx
+                .load_texture("app_logo_header", logo_image, egui::TextureOptions::LINEAR);
+
         let os_icons = OsIconAssets::load(&cc.egui_ctx);
         let draft_config = engine.config();
         let manual_connect_addr = draft_config.connect_address.clone();
@@ -73,6 +85,7 @@ impl MouseRoamingGui {
         Self {
             engine,
             tray,
+            app_logo,
             os_icons,
             active_tab: Tab::Layout,
             discovery_mode: DiscoveryMode::Lan,
@@ -118,6 +131,20 @@ impl eframe::App for MouseRoamingGui {
         let snap = self.engine.snapshot();
         self.handle_tray_events(ctx, &snap);
 
+        // When window is minimized, hide window so it stays resident in Windows System Tray / macOS Menu Bar
+        if ctx.input(|i| i.viewport().minimized == Some(true)) {
+            self.window_visible = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+
+        // When window close is requested ([X]), cancel exit and hide to background tray / menu bar
+        if ctx.input(|i| i.viewport().close_requested()) {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.window_visible = false;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
+
         // Alert user and wake window when there is a pending connection request
         if !snap.pending_connections.is_empty() {
             if !self.window_visible {
@@ -129,6 +156,10 @@ impl eframe::App for MouseRoamingGui {
                 egui::UserAttentionType::Critical,
             ));
             ctx.request_repaint_after(Duration::from_millis(300));
+        } else if !self.window_visible {
+            // Background resident mode: gently poll tray and connection requests
+            ctx.request_repaint_after(Duration::from_millis(150));
+            return;
         } else if self.drag_layout.is_some() {
             // Smooth 60+ fps updates while dragging; gentle polling otherwise
             ctx.request_repaint();
@@ -140,6 +171,7 @@ impl eframe::App for MouseRoamingGui {
         egui::TopBottomPanel::top("header_bar").show(ctx, |ui| {
             ui.add_space(6.0);
             ui.horizontal(|ui| {
+                ui.image((self.app_logo.id(), Vec2::splat(22.0)));
                 ui.heading(
                     RichText::new("MouseRoaming")
                         .strong()
@@ -160,6 +192,11 @@ impl eframe::App for MouseRoamingGui {
                     if ui.button("結束").clicked() {
                         self.engine.shutdown();
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+
+                    if ui.button("🗕 縮小常駐").clicked() {
+                        self.window_visible = false;
+                        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
                     }
 
                     if snap.running {

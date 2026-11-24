@@ -1,5 +1,5 @@
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem};
-use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
+use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
 pub enum TrayAction {
     ToggleWindow,
@@ -65,19 +65,38 @@ impl AppTray {
             }
         }
         while let Ok(ev) = TrayIconEvent::receiver().try_recv() {
-            if matches!(
-                ev,
-                TrayIconEvent::DoubleClick { .. }
-            ) {
-                actions.push(TrayAction::ToggleWindow);
+            match ev {
+                TrayIconEvent::Click {
+                    button: MouseButton::Left,
+                    button_state: MouseButtonState::Up,
+                    ..
+                }
+                | TrayIconEvent::DoubleClick {
+                    button: MouseButton::Left,
+                    ..
+                } => {
+                    actions.push(TrayAction::ToggleWindow);
+                }
+                _ => {}
             }
         }
         actions
     }
 }
 
-/// Generates a clean 32x32 RGBA tray icon (rounded slate badge with cyan roaming cursor).
+/// Generates a clean 32x32 RGBA tray icon from the official application logo assets.
 fn generate_tray_icon() -> anyhow::Result<Icon> {
+    if let Ok(icon_data) =
+        eframe::icon_data::from_png_bytes(include_bytes!("../../../assets/icon_32.png"))
+    {
+        return Ok(Icon::from_rgba(
+            icon_data.rgba,
+            icon_data.width,
+            icon_data.height,
+        )?);
+    }
+
+    // Fallback procedural icon
     let w: u32 = 32;
     let h: u32 = 32;
     let mut rgba = vec![0u8; (w * h * 4) as usize];

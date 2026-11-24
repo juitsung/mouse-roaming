@@ -117,11 +117,17 @@ fn main() -> Result<()> {
         }
     };
 
+    let mut viewport = eframe::egui::ViewportBuilder::default()
+        .with_title("MouseRoaming — 跨 Windows / macOS 滑鼠共享")
+        .with_inner_size([820.0, 640.0])
+        .with_min_inner_size([680.0, 520.0]);
+
+    if let Ok(icon_data) = eframe::icon_data::from_png_bytes(include_bytes!("../../../assets/icon.png")) {
+        viewport = viewport.with_icon(icon_data);
+    }
+
     let native_options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("MouseRoaming — 跨 Windows / macOS 滑鼠共享")
-            .with_inner_size([820.0, 640.0])
-            .with_min_inner_size([680.0, 520.0]),
+        viewport,
         ..Default::default()
     };
 
