@@ -53,6 +53,7 @@ pub struct MouseRoamingGui {
     manual_connect_addr: String,
     manual_bluetooth_addr: String,
     window_visible: bool,
+    quitting: bool,
     status_banner: Option<String>,
     drag_layout: Option<DragLayoutState>,
 }
@@ -93,6 +94,7 @@ impl MouseRoamingGui {
             manual_connect_addr,
             manual_bluetooth_addr,
             window_visible: true,
+            quitting: false,
             status_banner: None,
             drag_layout: None,
         }
@@ -118,6 +120,7 @@ impl MouseRoamingGui {
                     self.engine.send(EngineCommand::ManualSwitch(None));
                 }
                 TrayAction::Quit => {
+                    self.quitting = true;
                     self.engine.shutdown();
                     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                 }
@@ -138,8 +141,8 @@ impl eframe::App for MouseRoamingGui {
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
         }
 
-        // When window close is requested ([X]), cancel exit and hide to background tray / menu bar
-        if ctx.input(|i| i.viewport().close_requested()) {
+        // When window close is requested ([X]), cancel exit and hide to background tray / menu bar unless explicitly quitting
+        if ctx.input(|i| i.viewport().close_requested()) && !self.quitting {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             self.window_visible = false;
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
@@ -190,6 +193,7 @@ impl eframe::App for MouseRoamingGui {
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("結束").clicked() {
+                        self.quitting = true;
                         self.engine.shutdown();
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }

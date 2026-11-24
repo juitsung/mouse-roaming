@@ -37,6 +37,12 @@
   - **快捷喚醒**：支援左鍵單擊／雙擊系統匣圖示或右鍵選單「顯示 / 隱藏主視窗」隨時還原視窗。
   - **安全審核喚醒**：當有新裝置發起連線審核請求時，自動喚起視窗並給予最上層焦點，確保不漏接連線請求。
 
+### 🐛 錯誤修復 (Fixed)
+- **修復點擊「結束」無法退出應用程式的問題**：新增明確的退出狀態旗標 (`quitting`)，區分「點擊標題列關閉按鈕 `[X]` 縮小常駐」與「點擊介面『結束』按鈕／系統匣選單『結束 MouseRoaming』」，確保主動點擊結束時不會被 `CancelClose` 攔截，能正常關閉視窗與背景引擎。
+- **修復 macOS 藍牙模組編譯錯誤與警告**：
+  - 將 `parse_macos_bluetooth_json` 改為無需外部 `serde_json` 相依套件的原生輕量 JSON 解析器，解決 `E0433: cannot find module or crate serde_json` 編譯錯誤。
+  - 將 `tracing::debug` 匯入移至 Windows 專屬函式 `scan_windows_bluetooth_devices` 作用域內，消除非 Windows 平台下的 `unused_imports` 編譯警告。
+
 
 ---
 
