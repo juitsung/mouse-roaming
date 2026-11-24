@@ -1,0 +1,18 @@
+[package]
+name = "mouseroaming-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+directories.workspace = true
+hostname.workspace = true
+mouseroaming-net.workspace = true
+mouseroaming-os.workspace = true
+mouseroaming-proto.workspace = true
+serde.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
+uuid.workspace = true

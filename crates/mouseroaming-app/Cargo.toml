@@ -1,0 +1,21 @@
+[package]
+name = "mouseroaming-app"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "mouseroaming"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+eframe.workspace = true
+mouseroaming-core.workspace = true
+mouseroaming-net.workspace = true
+mouseroaming-os.workspace = true
+mouseroaming-proto.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tray-icon.workspace = true

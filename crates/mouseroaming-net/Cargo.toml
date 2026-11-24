@@ -1,0 +1,19 @@
+[package]
+name = "mouseroaming-net"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+hex.workspace = true
+mdns-sd.workspace = true
+mouseroaming-proto.workspace = true
+rcgen.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+rustls-pki-types.workspace = true
+serde.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-rustls.workspace = true
+tracing.workspace = true
