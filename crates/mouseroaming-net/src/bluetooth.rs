@@ -1,6 +1,5 @@
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
-use tracing::debug;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BluetoothAdapterInfo {
@@ -101,6 +100,7 @@ pub fn scan_paired_bluetooth_hosts() -> Vec<BluetoothHostDevice> {
 #[cfg(target_os = "windows")]
 fn scan_windows_bluetooth_devices(devices: &mut Vec<BluetoothHostDevice>) {
     use std::ptr::null_mut;
+    use tracing::debug;
     use windows_sys::Win32::Foundation::ERROR_SUCCESS;
     use windows_sys::Win32::System::Registry::{
         RegCloseKey, RegEnumKeyExW, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_LOCAL_MACHINE,
@@ -263,40 +263,93 @@ fn scan_macos_bluetooth_devices(devices: &mut Vec<BluetoothHostDevice>) {
 
 #[cfg(target_os = "macos")]
 fn parse_macos_bluetooth_json(json_text: &str, devices: &mut Vec<BluetoothHostDevice>) {
-    if let Ok(val) = serde_json::from_str::<serde_json::Value>(json_text) {
-        if let Some(arr) = val.get("SPBluetoothDataType").and_then(|v| v.as_array()) {
-            for item in arr {
-                if let Some(devices_obj) = item
-                    .get("device_connected")
-                    .or_else(|| item.get("device_not_connected"))
-                {
-                    if let Some(dev_map) = devices_obj.as_object() {
-                        for (dev_name, dev_val) in dev_map {
-                            let mac = dev_val
-                                .get("device_address")
-                                .and_then(|a| a.as_str())
-                                .unwrap_or_default()
-                                .to_string();
-                            let is_computer = dev_val
-                                .get("device_minorType")
-                                .and_then(|t| t.as_str())
-                                .map(|t| t.to_lowercase().contains("computer") || t.to_lowercase().contains("mac"))
-                                .unwrap_or(false)
-                                || dev_name.to_lowercase().contains("mac")
-                                || dev_name.to_lowercase().contains("pc");
+    // Parse system_profiler SPBluetoothDataType -json output without requiring serde_json:
+    // Each paired device entry inside "device_connected" or "device_not_connected" looks like:
+    //   "Device Name" : {
+    //     "device_address" : "AA:BB:CC:DD:EE:FF",
+    //     "device_minorType" : "Laptop",
+    //     ...
+    //   }
+    let mut current_name: Option<String> = None;
+    let mut current_mac: Option<String> = None;
+    let mut current_minor_type = String::new();
 
-                            devices.push(BluetoothHostDevice {
-                                name: dev_name.clone(),
-                                mac,
-                                is_computer,
-                                last_seen_ip: None,
-                            });
-                        }
-                    }
+    let flush_device = |name: &mut Option<String>,
+                        mac: &mut Option<String>,
+                        minor_type: &mut String,
+                        out: &mut Vec<BluetoothHostDevice>| {
+        if let (Some(dev_name), Some(dev_mac)) = (name.take(), mac.take()) {
+            let name_lower = dev_name.to_lowercase();
+            let type_lower = minor_type.to_lowercase();
+            let is_computer = type_lower.contains("computer")
+                || type_lower.contains("mac")
+                || type_lower.contains("laptop")
+                || type_lower.contains("desktop")
+                || name_lower.contains("mac")
+                || name_lower.contains("pc")
+                || name_lower.contains("book");
+            out.push(BluetoothHostDevice {
+                name: dev_name,
+                mac: format_mac_address(&dev_mac),
+                is_computer,
+                last_seen_ip: None,
+            });
+        }
+        minor_type.clear();
+    };
+
+    for line in json_text.lines() {
+        let trimmed = line.trim();
+        if trimmed.ends_with('{') {
+            if let Some(key) = extract_json_key(trimmed) {
+                if key != "SPBluetoothDataType"
+                    && key != "device_connected"
+                    && key != "device_not_connected"
+                    && !key.starts_with("controller_")
+                {
+                    flush_device(
+                        &mut current_name,
+                        &mut current_mac,
+                        &mut current_minor_type,
+                        devices,
+                    );
+                    current_name = Some(key);
                 }
+            }
+        } else if let Some((k, v)) = extract_json_kv(trimmed) {
+            if k == "device_address" {
+                current_mac = Some(v);
+            } else if k == "device_minorType" || k == "device_majorType" {
+                current_minor_type.push(' ');
+                current_minor_type.push_str(&v);
             }
         }
     }
+
+    flush_device(
+        &mut current_name,
+        &mut current_mac,
+        &mut current_minor_type,
+        devices,
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn extract_json_key(line: &str) -> Option<String> {
+    let start = line.find('"')? + 1;
+    let rest = &line[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+#[cfg(target_os = "macos")]
+fn extract_json_kv(line: &str) -> Option<(String, String)> {
+    let colon_idx = line.find(':')?;
+    let left = line[..colon_idx].trim();
+    let right = line[colon_idx + 1..].trim().trim_end_matches(',');
+    let key = left.strip_prefix('"')?.strip_suffix('"')?.to_string();
+    let val = right.strip_prefix('"')?.strip_suffix('"')?.to_string();
+    Some((key, val))
 }
 
 /// Helper to format raw hex string (e.g. `f8ffc2609d10`) to standard MAC format `F8:FF:C2:60:9D:10`.
