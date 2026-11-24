@@ -193,6 +193,8 @@ impl OsBackend for MockOsBackend {
         self.cursor_visible.store(visible, Ordering::SeqCst);
     }
 
+    fn notify(&self, _title: &str, _message: &str) {}
+
     fn start_capture(
         &self,
         control: Arc<CaptureControl>,

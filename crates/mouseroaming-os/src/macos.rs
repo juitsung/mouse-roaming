@@ -542,6 +542,20 @@ impl OsBackend for MacOsBackend {
         }
     }
 
+    fn notify(&self, title: &str, message: &str) {
+        let t = title.replace('"', "\\\"");
+        let m = message.replace('"', "\\\"");
+        std::thread::spawn(move || {
+            let _ = std::process::Command::new("afplay")
+                .arg("/System/Library/Sounds/Ping.aiff")
+                .spawn();
+            let _ = std::process::Command::new("osascript")
+                .arg("-e")
+                .arg(format!("display notification \"{m}\" with title \"{t}\""))
+                .spawn();
+        });
+    }
+
     fn start_capture(
         &self,
         control: Arc<CaptureControl>,

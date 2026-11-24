@@ -9,6 +9,23 @@
 
 ---
 
+## [Unreleased]
+
+### ✨ 新增功能 (Added)
+- **連線通知與主機審核機制 (Connection Notification & Approval)**：
+  - 新增連線審核模式：預設啟用新連線審核，未經允許前攔截暫緩連線握手。
+  - **桌面通知與提示音 (Native Notification & Sound)**：新連線請求、連線成功與斷線時即時發送桌面通知；Windows 呼叫 `MessageBeep`，macOS 呼叫 `afplay Glass.aiff` 發出提示音。
+  - **30 秒倒數審核橫幅**：頂部浮現連線核准資訊卡，提供「✔ 允許本次 (Allow Once)」、「🛡 允許並永久信任 (Allow & Remember)」、「✖ 拒絕 (Deny)」，逾時 30 秒自動拒絕並切斷未經授權連線。
+  - **信任清單管理**：在設定面板中可隨時檢視與撤銷已永久信任的裝置清單。
+- **主機藍牙連線方式 (Bluetooth Host Connection)**：
+  - **本機藍牙介面偵測**：自動偵測 Windows / macOS 藍牙網路介面卡與藍牙個人區域網路 (PAN) IP 位址。
+  - **已配對主機掃描**：Windows 透過系統註冊表 (`BTHPORT\Parameters\Devices`) 自動讀取已配對的電腦主機名稱、藍牙 MAC 位址與 PAN IP。
+  - **一鍵藍牙連線**：在「探索與連線」分頁中新增「藍牙探索與主機連線」子分頁，可對已配對主機進行一鍵連線或輸入藍牙位址連線。
+  - **快捷系統藍牙設定**：提供一鍵開啟 Windows / macOS 作業系統內建藍牙設定頁面，方便快速進行主機配對與 PAN 網路共用設定。
+  - **傳輸媒介模式切換**：支援區域網路 (LAN)、藍牙 (Bluetooth)、自動雙模 (Auto) 切換。
+
+---
+
 ## [0.2.0] - 2026-11-24
 
 ### ✨ 新增功能 (Added)

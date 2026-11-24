@@ -24,14 +24,36 @@ impl AppRole {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConnectionTransportMode {
+    /// 區域網路 (Wi-Fi / Ethernet LAN)
+    Lan,
+    /// 藍牙連線 (Bluetooth PAN / Direct)
+    Bluetooth,
+    /// 自動／雙模混合 (Auto / Hybrid)
+    Auto,
+}
+
+impl ConnectionTransportMode {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Lan => "🌐 區域網路 (Wi-Fi / LAN)",
+            Self::Bluetooth => "📶 藍牙連線 (Bluetooth)",
+            Self::Auto => "⚡ 自動雙模 (LAN / 藍牙)",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AppConfig {
     pub peer_id: String,
     pub hostname: String,
     pub role: AppRole,
+    pub transport_mode: ConnectionTransportMode,
     pub listen_port: u16,
     pub connect_address: String,
+    pub bluetooth_target_addr: String,
     pub pairing_token: String,
     pub default_client_edge: Edge,
     pub dead_corner_px: i32,
@@ -42,6 +64,9 @@ pub struct AppConfig {
     pub auto_start_service: bool,
     pub trusted_fingerprints: HashMap<String, String>,
     pub edge_bindings: HashMap<Edge, String>,
+    pub require_connection_approval: bool,
+    pub notify_on_connection: bool,
+    pub allowed_peers: HashMap<String, String>,
 }
 
 impl Default for AppConfig {
@@ -55,8 +80,10 @@ impl Default for AppConfig {
             peer_id: Uuid::new_v4().to_string(),
             hostname: host,
             role: AppRole::Server,
+            transport_mode: ConnectionTransportMode::Lan,
             listen_port: DEFAULT_PORT,
             connect_address: format!("127.0.0.1:{DEFAULT_PORT}"),
+            bluetooth_target_addr: String::new(),
             pairing_token: String::new(),
             default_client_edge: Edge::Right,
             dead_corner_px: 24,
@@ -67,6 +94,9 @@ impl Default for AppConfig {
             auto_start_service: true,
             trusted_fingerprints: HashMap::new(),
             edge_bindings: HashMap::new(),
+            require_connection_approval: true,
+            notify_on_connection: true,
+            allowed_peers: HashMap::new(),
         }
     }
 }

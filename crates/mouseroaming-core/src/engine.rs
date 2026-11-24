@@ -1,10 +1,11 @@
 use crate::clipboard_sync::ClipboardSync;
-use crate::config::{AppConfig, AppRole};
+use crate::config::{AppConfig, AppRole, ConnectionTransportMode};
 use crate::router::EdgeRouter;
 use anyhow::Result;
 use mouseroaming_net::{
-    connect_tls, format_short_fingerprint, load_or_generate_identity, DiscoveredPeer,
-    DiscoveryEvent, MdnsService, MessageConnection, NodeIdentity, TlsServerListener, TrustPolicy,
+    connect_tls, detect_bluetooth_adapter, format_short_fingerprint, load_or_generate_identity,
+    open_system_bluetooth_settings, scan_paired_bluetooth_hosts, DiscoveredPeer, DiscoveryEvent,
+    MdnsService, MessageConnection, NodeIdentity, TlsServerListener, TrustPolicy,
 };
 use mouseroaming_os::{CaptureControl, InputEvent, InputInjector, OsBackend, PermissionStatus};
 use mouseroaming_proto::{
@@ -17,6 +18,8 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tracing::{debug, error, info, warn};
+
+pub use mouseroaming_net::{BluetoothAdapterInfo, BluetoothHostDevice};
 
 const MAX_LOG_LINES: usize = 200;
 
@@ -79,10 +82,34 @@ pub fn detect_local_ip() -> String {
 }
 
 #[derive(Debug, Clone)]
+pub struct PendingConnection {
+    pub id: u64,
+    pub peer_id: String,
+    pub hostname: String,
+    pub os: OsKind,
+    pub addr: String,
+    pub screen: ScreenRect,
+    pub created_at: Instant,
+    pub timeout_secs: u64,
+}
+
+impl PendingConnection {
+    pub fn remaining_secs(&self) -> u64 {
+        let elapsed = self.created_at.elapsed().as_secs();
+        self.timeout_secs.saturating_sub(elapsed)
+    }
+
+    pub fn is_expired(&self) -> bool {
+        self.created_at.elapsed().as_secs() >= self.timeout_secs
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct EngineSnapshot {
     pub running: bool,
     pub paused: bool,
     pub role: AppRole,
+    pub transport_mode: ConnectionTransportMode,
     pub local_peer_id: String,
     pub local_hostname: String,
     pub local_ip: String,
@@ -94,6 +121,9 @@ pub struct EngineSnapshot {
     pub active_screen_label: String,
     pub connected_peers: Vec<ConnectedPeerInfo>,
     pub discovered_peers: Vec<DiscoveredPeer>,
+    pub pending_connections: Vec<PendingConnection>,
+    pub bluetooth_adapter: BluetoothAdapterInfo,
+    pub paired_bluetooth_hosts: Vec<BluetoothHostDevice>,
     pub permission: PermissionStatus,
     pub logs: VecDeque<String>,
 }
@@ -104,6 +134,7 @@ pub enum EngineCommand {
     Stop,
     SetPaused(bool),
     UpdateConfig(AppConfig),
+    SetTransportMode(ConnectionTransportMode),
     BindPeerToEdge {
         peer_id: String,
         edge: Edge,
@@ -113,11 +144,25 @@ pub enum EngineCommand {
         addr: String,
         expected_fingerprint: Option<String>,
     },
+    ConnectViaBluetooth {
+        addr: String,
+        expected_fingerprint: Option<String>,
+    },
+    RefreshBluetooth,
+    OpenSystemBluetoothSettings,
     ManualSwitch(Option<Edge>),
     TrustFingerprint {
         key: String,
         fingerprint: String,
     },
+    AllowConnection {
+        id: u64,
+        remember: bool,
+    },
+    DenyConnection {
+        id: u64,
+    },
+    RevokeAllowedPeer(String),
     Shutdown,
 }
 
@@ -184,10 +229,14 @@ impl MouseRoamingEngine {
             detect_local_ip()
         };
 
+        let bluetooth_adapter = detect_bluetooth_adapter();
+        let paired_bluetooth_hosts = scan_paired_bluetooth_hosts();
+
         let initial_snapshot = EngineSnapshot {
             running: false,
             paused: false,
             role: config.role,
+            transport_mode: config.transport_mode,
             local_peer_id: config.peer_id.clone(),
             local_hostname: config.hostname.clone(),
             local_ip,
@@ -199,6 +248,9 @@ impl MouseRoamingEngine {
             active_screen_label: "本機 (Local)".into(),
             connected_peers: Vec::new(),
             discovered_peers: Vec::new(),
+            pending_connections: Vec::new(),
+            bluetooth_adapter,
+            paired_bluetooth_hosts,
             permission,
             logs: VecDeque::new(),
         };
@@ -330,6 +382,7 @@ async fn supervisor_loop(
                             s.running = false;
                             s.listen_addr = None;
                             s.connected_peers.clear();
+                            s.pending_connections.clear();
                             s.active_screen_label = "本機 (Local)".into();
                         }
                         push_log(&snapshot, "服務已停止");
@@ -536,10 +589,102 @@ async fn supervisor_loop(
                             let _ = tx.send(WorkerControl::ManualSwitch(edge));
                         }
                     }
+                    EngineCommand::SetTransportMode(mode) => {
+                        {
+                            let mut cfg = shared_config.write().unwrap();
+                            cfg.transport_mode = mode;
+                            let _ = cfg.save(&options.config_dir);
+                        }
+                        if let Ok(mut s) = snapshot.write() {
+                            s.transport_mode = mode;
+                        }
+                        push_log(&snapshot, format!("已切換連線媒介為: {}", mode.label()));
+                    }
+                    EngineCommand::ConnectViaBluetooth { addr, expected_fingerprint } => {
+                        {
+                            let mut cfg = shared_config.write().unwrap();
+                            cfg.role = AppRole::Client;
+                            cfg.transport_mode = ConnectionTransportMode::Bluetooth;
+                            cfg.connect_address = addr.clone();
+                            cfg.bluetooth_target_addr = addr.clone();
+                            if let Some(fp) = expected_fingerprint {
+                                if !fp.is_empty() {
+                                    cfg.trusted_fingerprints.insert(addr.clone(), fp);
+                                }
+                            }
+                            let _ = cfg.save(&options.config_dir);
+                        }
+                        if let Some(tx) = active_stop_tx.take() {
+                            let _ = tx.send(true);
+                        }
+                        if let Some(ref mut m) = mdns {
+                            m.stop_advertising();
+                        }
+                        let (stop_tx, stop_rx) = watch::channel(false);
+                        let (w_tx, w_rx) = mpsc::unbounded_channel();
+                        active_stop_tx = Some(stop_tx);
+                        active_worker_cmd_tx = Some(w_tx);
+                        if let Ok(mut s) = snapshot.write() {
+                            s.running = true;
+                            s.role = AppRole::Client;
+                            s.transport_mode = ConnectionTransportMode::Bluetooth;
+                        }
+                        push_log(&snapshot, format!("正在透過藍牙連線至目標主機 {addr}..."));
+                        let b = backend.clone();
+                        let snap = snapshot.clone();
+                        let scfg = shared_config.clone();
+                        let cfg_dir = options.config_dir.clone();
+                        tokio::spawn(async move {
+                            run_client_worker(b, scfg, cfg_dir, snap, stop_rx, w_rx).await;
+                        });
+                    }
+                    EngineCommand::RefreshBluetooth => {
+                        let bt_adapter = detect_bluetooth_adapter();
+                        let bt_hosts = scan_paired_bluetooth_hosts();
+                        if let Ok(mut s) = snapshot.write() {
+                            s.bluetooth_adapter = bt_adapter;
+                            s.paired_bluetooth_hosts = bt_hosts;
+                        }
+                        push_log(&snapshot, "已重新整理藍牙介面與已配對藍牙主機清單");
+                    }
+                    EngineCommand::OpenSystemBluetoothSettings => {
+                        open_system_bluetooth_settings();
+                        push_log(&snapshot, "已開啟作業系統藍牙設定");
+                    }
                     EngineCommand::TrustFingerprint { key, fingerprint } => {
                         let mut cfg = shared_config.write().unwrap();
                         cfg.trusted_fingerprints.insert(key, fingerprint);
                         let _ = cfg.save(&options.config_dir);
+                    }
+                    EngineCommand::AllowConnection { id, remember } => {
+                        if let Some(ref tx) = active_worker_cmd_tx {
+                            let _ = tx.send(WorkerControl::ResolvePendingConnection {
+                                id,
+                                allowed: true,
+                                remember,
+                            });
+                        }
+                    }
+                    EngineCommand::DenyConnection { id } => {
+                        if let Some(ref tx) = active_worker_cmd_tx {
+                            let _ = tx.send(WorkerControl::ResolvePendingConnection {
+                                id,
+                                allowed: false,
+                                remember: false,
+                            });
+                        }
+                    }
+                    EngineCommand::RevokeAllowedPeer(peer_id) => {
+                        let name = {
+                            let mut cfg = shared_config.write().unwrap();
+                            let n = cfg
+                                .allowed_peers
+                                .remove(&peer_id)
+                                .unwrap_or_else(|| peer_id.clone());
+                            let _ = cfg.save(&options.config_dir);
+                            n
+                        };
+                        push_log(&snapshot, format!("已撤銷裝置「{name}」的連線允許許可"));
                     }
                 }
             }
@@ -554,6 +699,11 @@ enum WorkerControl {
     BindEdge { peer_id: String, edge: Edge },
     UnbindEdge(Edge),
     ManualSwitch(Option<Edge>),
+    ResolvePendingConnection {
+        id: u64,
+        allowed: bool,
+        remember: bool,
+    },
 }
 
 struct ServerPeer {
@@ -566,6 +716,15 @@ struct ServerPeer {
 }
 
 enum ServerInbound {
+    ConnectionRequest {
+        id: u64,
+        peer_id: String,
+        hostname: String,
+        os: OsKind,
+        addr: String,
+        screen: ScreenRect,
+        reply_tx: tokio::sync::oneshot::Sender<bool>,
+    },
     Connected {
         peer: ServerPeer,
     },
@@ -610,7 +769,7 @@ async fn run_server_worker(
     backend: Arc<dyn OsBackend>,
     identity: NodeIdentity,
     shared_config: Arc<RwLock<AppConfig>>,
-    _cfg_dir: PathBuf,
+    cfg_dir: PathBuf,
     snapshot: Arc<RwLock<EngineSnapshot>>,
     bind_ip: IpAddr,
     mut stop_rx: watch::Receiver<bool>,
@@ -703,9 +862,12 @@ async fn run_server_worker(
     });
 
     let mut peers: HashMap<String, ServerPeer> = HashMap::new();
+    let mut pending_requests: HashMap<u64, (PendingConnection, tokio::sync::oneshot::Sender<bool>)> =
+        HashMap::new();
     let mut paused = false;
     let mut clip_interval = tokio::time::interval(Duration::from_millis(350));
     let mut ping_interval = tokio::time::interval(Duration::from_secs(5));
+    let mut pending_tick = tokio::time::interval(Duration::from_secs(1));
     let mut ping_seq: u64 = 0;
 
     loop {
@@ -761,10 +923,71 @@ async fn run_server_worker(
                             }
                         }
                     }
+                    WorkerControl::ResolvePendingConnection { id, allowed, remember } => {
+                        if let Some((info, tx)) = pending_requests.remove(&id) {
+                            if allowed && remember {
+                                let mut wcfg = shared_config.write().unwrap();
+                                wcfg.allowed_peers.insert(info.peer_id.clone(), info.hostname.clone());
+                                let _ = wcfg.save(&cfg_dir);
+                                push_log(
+                                    &snapshot,
+                                    format!("已將裝置「{}」({}) 加入永久信任名單", info.hostname, info.peer_id),
+                                );
+                            }
+                            if allowed {
+                                push_log(&snapshot, format!("已允許裝置「{}」的連線請求", info.hostname));
+                            } else {
+                                push_log(&snapshot, format!("已拒絕裝置「{}」的連線請求", info.hostname));
+                            }
+                            let _ = tx.send(allowed);
+                        }
+                        if let Ok(mut s) = snapshot.write() {
+                            s.pending_connections = pending_requests.values().map(|(p, _)| p.clone()).collect();
+                        }
+                    }
                 }
             }
             Some(inbound) = inbound_rx.recv() => {
                 match inbound {
+                    ServerInbound::ConnectionRequest {
+                        id,
+                        peer_id,
+                        hostname,
+                        os,
+                        addr,
+                        screen,
+                        reply_tx,
+                    } => {
+                        let info = PendingConnection {
+                            id,
+                            peer_id: peer_id.clone(),
+                            hostname: hostname.clone(),
+                            os,
+                            addr: addr.clone(),
+                            screen,
+                            created_at: Instant::now(),
+                            timeout_secs: 30,
+                        };
+                        pending_requests.insert(id, (info.clone(), reply_tx));
+                        if let Ok(mut s) = snapshot.write() {
+                            s.pending_connections =
+                                pending_requests.values().map(|(p, _)| p.clone()).collect();
+                        }
+                        let cur_notify = shared_config.read().unwrap().notify_on_connection;
+                        if cur_notify {
+                            backend.notify(
+                                "MouseRoaming 連線請求",
+                                &format!("裝置「{}」({}) 正在請求連線，需要您的允許", hostname, addr),
+                            );
+                        }
+                        push_log(
+                            &snapshot,
+                            format!(
+                                "🔔 收到來自 {} ({}) 的連線請求，等待本機確認允許中...",
+                                hostname, addr
+                            ),
+                        );
+                    }
                     ServerInbound::Connected { peer } => {
                         let pid = peer.peer_id.clone();
                         let hostname = peer.hostname.clone();
@@ -788,11 +1011,25 @@ async fn run_server_worker(
                         } else {
                             push_log(&snapshot, format!("裝置 {hostname} ({os_name}) 已連線"));
                         }
+                        let cur_notify = shared_config.read().unwrap().notify_on_connection;
+                        if cur_notify {
+                            backend.notify(
+                                "MouseRoaming 連線通知",
+                                &format!("裝置「{hostname}」({os_name}) 已成功連線"),
+                            );
+                        }
                         peers.insert(pid, peer);
                         update_server_snapshot(&snapshot, &peers, &router);
                     }
                     ServerInbound::Disconnected { peer_id } => {
                         if let Some(p) = peers.remove(&peer_id) {
+                            let cur_notify = shared_config.read().unwrap().notify_on_connection;
+                            if cur_notify {
+                                backend.notify(
+                                    "MouseRoaming 連線通知",
+                                    &format!("裝置「{}」已中斷連線", p.hostname),
+                                );
+                            }
                             push_log(&snapshot, format!("裝置 {} 已斷線", p.hostname));
                         }
                         if router.active_remote().map(|a| a.peer_id.as_str()) == Some(peer_id.as_str()) {
@@ -924,10 +1161,36 @@ async fn run_server_worker(
                     let _ = peer.tx.send(Message::Ping { seq: ping_seq });
                 }
             }
+            _ = pending_tick.tick() => {
+                let before_len = pending_requests.len();
+                pending_requests.retain(|_id, (info, _tx)| {
+                    if info.is_expired() {
+                        push_log(
+                            &snapshot,
+                            format!("裝置「{}」的連線審核已逾時（已自動拒絕）", info.hostname),
+                        );
+                        false
+                    } else {
+                        true
+                    }
+                });
+                if pending_requests.len() != before_len {
+                    if let Ok(mut s) = snapshot.write() {
+                        s.pending_connections =
+                            pending_requests.values().map(|(p, _)| p.clone()).collect();
+                    }
+                }
+            }
         }
     }
 
     // Cleanup on stop
+    for (_id, (_info, tx)) in pending_requests.drain() {
+        let _ = tx.send(false);
+    }
+    if let Ok(mut s) = snapshot.write() {
+        s.pending_connections.clear();
+    }
     return_server_to_local(backend.as_ref(), &mut router, &capture_control, &peers, &snapshot);
 }
 
@@ -986,7 +1249,7 @@ async fn handle_server_client_conn(
     let (proto_ver, peer_id, hostname, os, screen, token) = hello;
     let cfg = shared_config.read().unwrap().clone();
 
-    let (accepted, reason) = if proto_ver != PROTOCOL_VERSION {
+    let (mut accepted, mut reason) = if proto_ver != PROTOCOL_VERSION {
         (
             false,
             Some(format!(
@@ -1000,6 +1263,44 @@ async fn handle_server_client_conn(
     } else {
         (true, None)
     };
+
+    if accepted {
+        let need_approval =
+            cfg.require_connection_approval && !cfg.allowed_peers.contains_key(&peer_id);
+        if need_approval {
+            static NEXT_CONN_REQ_ID: std::sync::atomic::AtomicU64 =
+                std::sync::atomic::AtomicU64::new(1);
+            let req_id = NEXT_CONN_REQ_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+            let req = ServerInbound::ConnectionRequest {
+                id: req_id,
+                peer_id: peer_id.clone(),
+                hostname: hostname.clone(),
+                os,
+                addr: peer_addr.to_string(),
+                screen,
+                reply_tx,
+            };
+            if inbound_tx.send(req).is_err() {
+                accepted = false;
+                reason = Some("伺服器內部傳遞連線請求失敗".into());
+            } else {
+                match tokio::time::timeout(Duration::from_secs(30), reply_rx).await {
+                    Ok(Ok(true)) => {
+                        accepted = true;
+                    }
+                    Ok(Ok(false)) => {
+                        accepted = false;
+                        reason = Some("主控端已拒絕此連線請求".into());
+                    }
+                    _ => {
+                        accepted = false;
+                        reason = Some("連線審核等待逾時 (主控端未及時核准)".into());
+                    }
+                }
+            }
+        }
+    }
 
     let welcome = Message::Welcome {
         protocol_version: PROTOCOL_VERSION,
@@ -1164,7 +1465,9 @@ async fn run_client_worker(
             continue;
         }
 
-        let server_info = match tokio::time::timeout(Duration::from_secs(5), conn.recv()).await {
+        push_log(&snapshot, "已送出連線請求，等待主控端審核允許...");
+
+        let server_info = match tokio::time::timeout(Duration::from_secs(35), conn.recv()).await {
             Ok(Ok(Message::Welcome {
                 peer_id,
                 hostname,
@@ -1175,15 +1478,26 @@ async fn run_client_worker(
                 ..
             })) => {
                 if !accepted {
+                    let err_reason =
+                        reason.unwrap_or_else(|| "主控端未核准連線 (或連線被拒絕)".into());
                     push_log(
                         &snapshot,
-                        format!(
-                            "主機拒絕連線: {}",
-                            reason.unwrap_or_else(|| "未知原因".into())
-                        ),
+                        format!("主機拒絕連線: {err_reason}"),
                     );
+                    if cfg.notify_on_connection {
+                        backend.notify(
+                            "MouseRoaming 連線被拒絕",
+                            &format!("主機「{hostname}」拒絕連線: {err_reason}"),
+                        );
+                    }
                     tokio::time::sleep(Duration::from_secs(3)).await;
                     continue;
+                }
+                if cfg.notify_on_connection {
+                    backend.notify(
+                        "MouseRoaming 連線成功",
+                        &format!("已連線至主控端「{hostname}」({})", os.display_name()),
+                    );
                 }
                 ConnectedPeerInfo {
                     peer_id,
@@ -1204,7 +1518,7 @@ async fn run_client_worker(
                 continue;
             }
             Err(_) => {
-                push_log(&snapshot, "握手逾時");
+                push_log(&snapshot, "握手等待逾時（主控端可能未回應允許請求）");
                 continue;
             }
         };
@@ -1231,7 +1545,7 @@ async fn run_client_worker(
         let mut pressed_keys: HashSet<KeyCode> = HashSet::new();
         let mut pressed_buttons: HashSet<MouseButton> = HashSet::new();
         let mut clip_interval = tokio::time::interval(Duration::from_millis(350));
-        let mut cur_cfg = cfg;
+        let mut cur_cfg = cfg.clone();
 
         loop {
             tokio::select! {
@@ -1360,6 +1674,16 @@ async fn run_client_worker(
 
         // Always release stuck keys/buttons on disconnect
         release_client_inputs(injector.as_ref(), &mut pressed_keys, &mut pressed_buttons);
+        if cfg.notify_on_connection {
+            backend.notify(
+                "MouseRoaming 連線通知",
+                &format!("與主控端「{}」已中斷連線", server_info.hostname),
+            );
+        }
+        push_log(
+            &snapshot,
+            format!("與主控端 {} 的連線已中斷", server_info.hostname),
+        );
         if let Ok(mut s) = snapshot.write() {
             s.connected_peers.clear();
             s.active_screen_label = "未連線 (重新連線中...)".into();
@@ -1446,6 +1770,21 @@ mod tests {
             },
         )
         .expect("spawn client");
+
+        // Wait for pending connection request at server and approve it
+        let mut req_id = None;
+        for _ in 0..100 {
+            if let Some(req) = srv_handle.snapshot().pending_connections.first() {
+                req_id = Some(req.id);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let req_id = req_id.expect("pending connection request should arrive at server");
+        srv_handle.send(EngineCommand::AllowConnection {
+            id: req_id,
+            remember: true,
+        });
 
         // Wait for TLS handshake & peer connection
         for _ in 0..100 {
@@ -1582,6 +1921,118 @@ mod tests {
             win_backend.is_cursor_visible(),
             "local mouse cursor should be visible again after returning to local host"
         );
+
+        cli_handle.shutdown();
+        srv_handle.shutdown();
+        let _ = std::fs::remove_dir_all(&base_dir);
+    }
+
+    #[tokio::test]
+    async fn connection_approval_and_rejection_flow() {
+        let base_dir = std::env::temp_dir().join(format!(
+            "mouseroaming_approval_test_{}",
+            std::process::id()
+        ));
+        let srv_dir = base_dir.join("server");
+        let cli_dir = base_dir.join("client");
+        let _ = std::fs::remove_dir_all(&base_dir);
+
+        let win_backend = Arc::new(MockOsBackend::new(
+            OsKind::Windows,
+            ScreenRect::new(0, 0, 1920, 1080),
+        ));
+        let mac_backend = Arc::new(MockOsBackend::new(
+            OsKind::MacOS,
+            ScreenRect::new(0, 0, 1440, 900),
+        ));
+
+        let mut srv_cfg = AppConfig::default();
+        srv_cfg.hostname = "ApprovalHost".into();
+        srv_cfg.role = AppRole::Server;
+        srv_cfg.listen_port = 0;
+        srv_cfg.require_connection_approval = true;
+
+        let srv_handle = MouseRoamingEngine::spawn(
+            &tokio::runtime::Handle::current(),
+            win_backend.clone(),
+            srv_cfg,
+            EngineOptions {
+                config_dir: srv_dir,
+                enable_mdns: false,
+                bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            },
+        )
+        .expect("spawn server");
+
+        let mut listen_addr = None;
+        for _ in 0..50 {
+            if let Some(a) = srv_handle.snapshot().listen_addr {
+                listen_addr = Some(a);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let listen_addr = listen_addr.expect("server bound");
+
+        let mut cli_cfg = AppConfig::default();
+        cli_cfg.hostname = "TestClient".into();
+        cli_cfg.role = AppRole::Client;
+        cli_cfg.connect_address = listen_addr;
+
+        let cli_handle = MouseRoamingEngine::spawn(
+            &tokio::runtime::Handle::current(),
+            mac_backend.clone(),
+            cli_cfg,
+            EngineOptions {
+                config_dir: cli_dir,
+                enable_mdns: false,
+                bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            },
+        )
+        .expect("spawn client");
+
+        // 1. First connection attempt: wait for pending request and reject it
+        let mut req_id = None;
+        for _ in 0..100 {
+            if let Some(req) = srv_handle.snapshot().pending_connections.first() {
+                req_id = Some(req.id);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let req_id = req_id.expect("pending connection should appear");
+        assert_eq!(srv_handle.snapshot().connected_peers.len(), 0);
+
+        // Deny the request
+        srv_handle.send(EngineCommand::DenyConnection { id: req_id });
+
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert!(srv_handle.snapshot().pending_connections.is_empty());
+        assert_eq!(srv_handle.snapshot().connected_peers.len(), 0);
+
+        // 2. Client will retry after 2s: wait for new request and allow with remember
+        let mut retry_req_id = None;
+        for _ in 0..150 {
+            if let Some(req) = srv_handle.snapshot().pending_connections.first() {
+                retry_req_id = Some(req.id);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        let retry_req_id = retry_req_id.expect("retry pending connection should appear");
+        srv_handle.send(EngineCommand::AllowConnection {
+            id: retry_req_id,
+            remember: true,
+        });
+
+        // 3. Now it should connect successfully
+        for _ in 0..100 {
+            if !srv_handle.snapshot().connected_peers.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(srv_handle.snapshot().connected_peers.len(), 1);
 
         cli_handle.shutdown();
         srv_handle.shutdown();

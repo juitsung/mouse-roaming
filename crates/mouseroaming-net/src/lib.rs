@@ -1,3 +1,4 @@
+pub mod bluetooth;
 pub mod discovery;
 pub mod tls;
 pub mod transport;
@@ -23,6 +24,11 @@ pub enum NetError {
     #[error("connection closed")]
     Closed,
 }
+
+pub use bluetooth::{
+    detect_bluetooth_adapter, open_system_bluetooth_settings, scan_paired_bluetooth_hosts,
+    BluetoothAdapterInfo, BluetoothHostDevice,
+};
 
 pub use discovery::{DiscoveredPeer, DiscoveryEvent, MdnsService, MDNS_SERVICE_TYPE};
 pub use tls::{

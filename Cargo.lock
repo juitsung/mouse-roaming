@@ -2563,6 +2563,7 @@ name = "mouseroaming-net"
 version = "0.2.0"
 dependencies = [
  "hex",
+ "if-addrs",
  "mdns-sd",
  "mouseroaming-proto",
  "rcgen",
@@ -2575,6 +2576,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

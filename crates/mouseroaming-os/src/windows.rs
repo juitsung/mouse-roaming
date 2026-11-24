@@ -33,8 +33,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP,
     WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEHWHEEL, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT,
     WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN, WM_XBUTTONUP,
-    XBUTTON1, XBUTTON2,
+    XBUTTON1, XBUTTON2, MB_ICONASTERISK,
 };
+
+#[link(name = "user32")]
+extern "system" {
+    fn MessageBeep(uType: u32) -> windows_sys::Win32::Foundation::BOOL;
+}
 
 static DPI_INIT: Once = Once::new();
 
@@ -519,6 +524,28 @@ impl OsBackend for WindowsBackend {
 
     fn set_cursor_visible(&self, visible: bool) {
         set_windows_cursor_visible(visible);
+    }
+
+    fn notify(&self, title: &str, message: &str) {
+        unsafe {
+            let _ = MessageBeep(MB_ICONASTERISK);
+        }
+        let title_str = title.replace('\'', "''");
+        let msg_str = message.replace('\'', "''");
+        std::thread::spawn(move || {
+            let script = format!(
+                "[reflection.assembly]::loadwithpartialname('System.Windows.Forms') | Out-Null; \
+                 $n = New-Object System.Windows.Forms.NotifyIcon; \
+                 $n.Icon = [System.Drawing.SystemIcons]::Information; \
+                 $n.Visible = $true; \
+                 $n.ShowBalloonTip(4000, '{title_str}', '{msg_str}', [System.Windows.Forms.ToolTipIcon]::Info); \
+                 Start-Sleep -Seconds 3; \
+                 $n.Dispose()"
+            );
+            let _ = std::process::Command::new("powershell")
+                .args(["-NoProfile", "-WindowStyle", "Hidden", "-Command", &script])
+                .spawn();
+        });
     }
 
     fn start_capture(

@@ -5,7 +5,8 @@ use eframe::egui::{
     Order, Pos2, Rect, RichText, Rounding, Sense, Stroke, Vec2,
 };
 use mouseroaming_core::{
-    AppConfig, AppRole, ConnectedPeerInfo, EngineCommand, EngineHandle, EngineSnapshot,
+    AppConfig, AppRole, ConnectionTransportMode, ConnectedPeerInfo, EngineCommand, EngineHandle,
+    EngineSnapshot,
 };
 use mouseroaming_net::format_short_fingerprint;
 use mouseroaming_proto::{Edge, OsKind};
@@ -17,6 +18,12 @@ enum Tab {
     Discovery,
     Settings,
     Diagnostics,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscoveryMode {
+    Lan,
+    Bluetooth,
 }
 
 #[derive(Debug, Clone)]
@@ -40,8 +47,10 @@ pub struct MouseRoamingGui {
     tray: Option<AppTray>,
     os_icons: OsIconAssets,
     active_tab: Tab,
+    discovery_mode: DiscoveryMode,
     draft_config: AppConfig,
     manual_connect_addr: String,
+    manual_bluetooth_addr: String,
     window_visible: bool,
     status_banner: Option<String>,
     drag_layout: Option<DragLayoutState>,
@@ -59,14 +68,17 @@ impl MouseRoamingGui {
         let os_icons = OsIconAssets::load(&cc.egui_ctx);
         let draft_config = engine.config();
         let manual_connect_addr = draft_config.connect_address.clone();
+        let manual_bluetooth_addr = draft_config.bluetooth_target_addr.clone();
 
         Self {
             engine,
             tray,
             os_icons,
             active_tab: Tab::Layout,
+            discovery_mode: DiscoveryMode::Lan,
             draft_config,
             manual_connect_addr,
+            manual_bluetooth_addr,
             window_visible: true,
             status_banner: None,
             drag_layout: None,
@@ -106,8 +118,19 @@ impl eframe::App for MouseRoamingGui {
         let snap = self.engine.snapshot();
         self.handle_tray_events(ctx, &snap);
 
-        // Smooth 60+ fps updates while dragging; gentle polling otherwise
-        if self.drag_layout.is_some() {
+        // Alert user and wake window when there is a pending connection request
+        if !snap.pending_connections.is_empty() {
+            if !self.window_visible {
+                self.window_visible = true;
+                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+            ctx.send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                egui::UserAttentionType::Critical,
+            ));
+            ctx.request_repaint_after(Duration::from_millis(300));
+        } else if self.drag_layout.is_some() {
+            // Smooth 60+ fps updates while dragging; gentle polling otherwise
             ctx.request_repaint();
         } else {
             ctx.request_repaint_after(Duration::from_millis(120));
@@ -173,6 +196,14 @@ impl eframe::App for MouseRoamingGui {
                 );
                 ui.selectable_value(&mut self.active_tab, Tab::Settings, "⚙ 設定");
                 ui.selectable_value(&mut self.active_tab, Tab::Diagnostics, "📋 權限與日誌");
+                if !snap.pending_connections.is_empty() {
+                    ui.separator();
+                    ui.label(
+                        RichText::new(format!("🔔 {} 個待審核連線請求", snap.pending_connections.len()))
+                            .strong()
+                            .color(Color32::from_rgb(255, 215, 80)),
+                    );
+                }
             });
             ui.add_space(4.0);
         });
@@ -229,6 +260,8 @@ impl eframe::App for MouseRoamingGui {
                 ui.add_space(4.0);
             }
 
+            self.render_pending_connections(ui, &snap);
+
             match self.active_tab {
                 Tab::Layout => self.render_layout_tab(ui, &snap),
                 Tab::Discovery => self.render_discovery_tab(ui, &snap),
@@ -240,6 +273,138 @@ impl eframe::App for MouseRoamingGui {
 }
 
 impl MouseRoamingGui {
+    fn render_pending_connections(&mut self, ui: &mut egui::Ui, snap: &EngineSnapshot) {
+        if snap.pending_connections.is_empty() {
+            return;
+        }
+
+        for pending in &snap.pending_connections {
+            let rem_secs = pending.remaining_secs();
+            let card_frame = egui::Frame::none()
+                .fill(Color32::from_rgb(34, 38, 22))
+                .stroke(Stroke::new(2.0_f32, Color32::from_rgb(240, 185, 45)))
+                .rounding(Rounding::same(8.0))
+                .inner_margin(12.0);
+
+            card_frame.show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("🔔 連線請求通知 (需要允許)")
+                            .strong()
+                            .size(16.0)
+                            .color(Color32::from_rgb(255, 215, 80)),
+                    );
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let timer_color = if rem_secs <= 5 {
+                            Color32::from_rgb(255, 90, 80)
+                        } else {
+                            Color32::from_rgb(230, 200, 100)
+                        };
+                        ui.label(
+                            RichText::new(format!("⏳ 倒數 {rem_secs} 秒自動逾時"))
+                                .color(timer_color)
+                                .small(),
+                        );
+                    });
+                });
+
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    let (icon_rect, _) = ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
+                    paint_mini_os_icon(ui.painter(), icon_rect, pending.os, &self.os_icons);
+
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("裝置名稱:").strong());
+                            ui.label(
+                                RichText::new(&pending.hostname)
+                                    .strong()
+                                    .color(Color32::WHITE),
+                            );
+                            ui.separator();
+                            ui.label(RichText::new("系統:").strong());
+                            ui.label(pending.os.display_name());
+                            ui.separator();
+                            ui.label(RichText::new("來源位址:").strong());
+                            ui.label(RichText::new(&pending.addr).monospace());
+                        });
+                        ui.label(
+                            RichText::new(
+                                "此裝置正在嘗試連線至本機進行滑鼠與鍵盤共享。請確認是否允許該連線：",
+                            )
+                            .color(Color32::from_rgb(220, 220, 220)),
+                        );
+                    });
+                });
+
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("✔ 允許本次連線 (Allow Once)")
+                                    .strong()
+                                    .color(Color32::WHITE),
+                            )
+                            .fill(Color32::from_rgb(28, 140, 75))
+                            .min_size(Vec2::new(140.0, 28.0)),
+                        )
+                        .clicked()
+                    {
+                        self.engine.send(EngineCommand::AllowConnection {
+                            id: pending.id,
+                            remember: false,
+                        });
+                        self.status_banner = Some(format!("已允許「{}」連線", pending.hostname));
+                    }
+
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("🛡 允許並永久信任此裝置 (Allow & Remember)")
+                                    .strong()
+                                    .color(Color32::WHITE),
+                            )
+                            .fill(Color32::from_rgb(30, 110, 195))
+                            .min_size(Vec2::new(210.0, 28.0)),
+                        )
+                        .clicked()
+                    {
+                        self.draft_config.allowed_peers.insert(
+                            pending.peer_id.clone(),
+                            pending.hostname.clone(),
+                        );
+                        self.engine.send(EngineCommand::AllowConnection {
+                            id: pending.id,
+                            remember: true,
+                        });
+                        self.status_banner = Some(format!(
+                            "已允許「{}」連線並加入永久信任清單",
+                            pending.hostname
+                        ));
+                    }
+
+                    if ui
+                        .add(
+                            egui::Button::new(
+                                RichText::new("✖ 拒絕連線 (Deny)")
+                                    .color(Color32::from_rgb(255, 180, 180)),
+                            )
+                            .fill(Color32::from_rgb(140, 35, 35))
+                            .min_size(Vec2::new(100.0, 28.0)),
+                        )
+                        .clicked()
+                    {
+                        self.engine.send(EngineCommand::DenyConnection { id: pending.id });
+                        self.status_banner =
+                            Some(format!("已拒絕「{}」的連線請求", pending.hostname));
+                    }
+                });
+            });
+            ui.add_space(8.0);
+        }
+    }
+
     fn render_layout_tab(&mut self, ui: &mut egui::Ui, snap: &EngineSnapshot) {
         egui::ScrollArea::vertical().show(ui, |ui| {
             // Top summary row
@@ -898,11 +1063,14 @@ impl MouseRoamingGui {
         ui.heading("本機 TLS 1.3 識別資訊");
         egui::Frame::group(ui.style()).show(ui, |ui| {
             ui.label(format!(
-                "裝置名稱: {} ({})  •  IP: {}",
+                "裝置名稱: {} ({})  •  區域網路 IP: {}",
                 snap.local_hostname,
                 snap.local_os.display_name(),
                 snap.local_ip
             ));
+            if let Some(ref pan_ip) = snap.bluetooth_adapter.pan_ip {
+                ui.label(format!("藍牙 PAN IP: {pan_ip}"));
+            }
             ui.label(
                 RichText::new(format!("配對短指紋: {}", snap.local_fingerprint_short))
                     .strong()
@@ -915,83 +1083,263 @@ impl MouseRoamingGui {
             );
         });
 
-        ui.add_space(10.0);
-        ui.heading("手動連線至 Server (IP:Port)");
+        ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.text_edit_singleline(&mut self.manual_connect_addr);
-            if ui.button("🔗 以 Client 身分連線").clicked() {
-                let addr = self.manual_connect_addr.trim().to_string();
-                if !addr.is_empty() {
-                    self.draft_config.role = AppRole::Client;
-                    self.draft_config.connect_address = addr.clone();
-                    self.engine.send(EngineCommand::ConnectToPeer {
-                        addr: addr.clone(),
-                        expected_fingerprint: None,
-                    });
-                    self.status_banner = Some(format!("正在切換為 Client 並連線至 {addr}"));
-                }
-            }
+            ui.selectable_value(
+                &mut self.discovery_mode,
+                DiscoveryMode::Lan,
+                "🌐 區域網路探索 (Wi-Fi / LAN)",
+            );
+            ui.selectable_value(
+                &mut self.discovery_mode,
+                DiscoveryMode::Bluetooth,
+                "📶 藍牙探索與主機連線 (Bluetooth)",
+            );
         });
-
-        ui.add_space(12.0);
         ui.separator();
-        ui.heading("區域網路自動探索 (mDNS: _mouseroaming._tcp.local.)");
         ui.add_space(4.0);
 
-        if snap.discovered_peers.is_empty() {
-            ui.label(
-                RichText::new("正在掃描同一區域網路中開啟 Server 模式的 MouseRoaming 裝置...")
-                    .weak(),
-            );
-        } else {
-            for peer in &snap.discovered_peers {
+        match self.discovery_mode {
+            DiscoveryMode::Lan => {
+                ui.heading("手動連線至 Server (IP:Port)");
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut self.manual_connect_addr);
+                    if ui.button("🔗 以 Client 身分連線").clicked() {
+                        let addr = self.manual_connect_addr.trim().to_string();
+                        if !addr.is_empty() {
+                            self.draft_config.role = AppRole::Client;
+                            self.draft_config.transport_mode = ConnectionTransportMode::Lan;
+                            self.draft_config.connect_address = addr.clone();
+                            self.engine.send(EngineCommand::ConnectToPeer {
+                                addr: addr.clone(),
+                                expected_fingerprint: None,
+                            });
+                            self.status_banner =
+                                Some(format!("正在以 LAN 模式連線至 {addr}"));
+                        }
+                    }
+                });
+
+                ui.add_space(12.0);
+                ui.separator();
+                ui.heading("區域網路自動探索 (mDNS: _mouseroaming._tcp.local.)");
+                ui.add_space(4.0);
+
+                if snap.discovered_peers.is_empty() {
+                    ui.label(
+                        RichText::new("正在掃描同一區域網路中開啟 Server 模式的 MouseRoaming 裝置...")
+                            .weak(),
+                    );
+                } else {
+                    for peer in &snap.discovered_peers {
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                let (icon_rect, _) =
+                                    ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
+                                paint_mini_os_icon(
+                                    ui.painter(),
+                                    icon_rect,
+                                    peer.os,
+                                    &self.os_icons,
+                                );
+
+                                ui.vertical(|ui| {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{}  [{}]",
+                                            peer.hostname,
+                                            peer.os.display_name()
+                                        ))
+                                        .strong(),
+                                    );
+                                    let addr_str = peer
+                                        .preferred_addr()
+                                        .unwrap_or_else(|| format!("port {}", peer.port));
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "位址: {addr_str}  •  TLS 指紋: {}",
+                                            format_short_fingerprint(&peer.fingerprint)
+                                        ))
+                                        .small()
+                                        .weak(),
+                                    );
+                                });
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if let Some(addr) = peer.preferred_addr() {
+                                            if ui.button("🔗 一鍵連線 (信任指紋)").clicked() {
+                                                self.draft_config.role = AppRole::Client;
+                                                self.draft_config.transport_mode =
+                                                    ConnectionTransportMode::Lan;
+                                                self.draft_config.connect_address = addr.clone();
+                                                self.manual_connect_addr = addr.clone();
+                                                self.engine.send(EngineCommand::ConnectToPeer {
+                                                    addr: addr.clone(),
+                                                    expected_fingerprint: Some(
+                                                        peer.fingerprint.clone(),
+                                                    ),
+                                                });
+                                                self.status_banner = Some(format!(
+                                                    "已信任指紋並連線至 {} ({addr})",
+                                                    peer.hostname
+                                                ));
+                                            }
+                                        }
+                                    },
+                                );
+                            });
+                        });
+                        ui.add_space(4.0);
+                    }
+                }
+            }
+            DiscoveryMode::Bluetooth => {
+                ui.heading("本機藍牙介面狀態");
                 egui::Frame::group(ui.style()).show(ui, |ui| {
                     ui.horizontal(|ui| {
-                        let (icon_rect, _) =
-                            ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
-                        paint_mini_os_icon(ui.painter(), icon_rect, peer.os, &self.os_icons);
+                        let status_color = if snap.bluetooth_adapter.available {
+                            Color32::from_rgb(60, 200, 120)
+                        } else {
+                            Color32::from_rgb(230, 140, 40)
+                        };
+                        ui.label(
+                            RichText::new(format!(
+                                "藍牙介面: {} ({})",
+                                snap.bluetooth_adapter.name, snap.bluetooth_adapter.status
+                            ))
+                            .color(status_color)
+                            .strong(),
+                        );
+                    });
+                    if let Some(ref mac) = snap.bluetooth_adapter.mac {
+                        ui.label(RichText::new(format!("藍牙 MAC: {mac}")).small().weak());
+                    }
+                    if let Some(ref pan_ip) = snap.bluetooth_adapter.pan_ip {
+                        ui.label(
+                            RichText::new(format!(
+                                "藍牙個人區域網路 (PAN) IP: {pan_ip}"
+                            ))
+                            .color(Color32::from_rgb(100, 200, 255)),
+                        );
+                    } else {
+                        ui.label(
+                            RichText::new(
+                                "未偵測到藍牙 PAN IP（若兩台電腦已藍牙配對，可開啟 Windows/macOS 藍牙網路共用建立直連）",
+                            )
+                            .small()
+                            .weak(),
+                        );
+                    }
 
-                        ui.vertical(|ui| {
-                            ui.label(
-                                RichText::new(format!(
-                                    "{}  [{}]",
-                                    peer.hostname,
-                                    peer.os.display_name()
-                                ))
-                                .strong(),
-                            );
-                            let addr_str = peer
-                                .preferred_addr()
-                                .unwrap_or_else(|| format!("port {}", peer.port));
-                            ui.label(
-                                RichText::new(format!(
-                                    "位址: {addr_str}  •  TLS 指紋: {}",
-                                    format_short_fingerprint(&peer.fingerprint)
-                                ))
-                                .small()
-                                .weak(),
-                            );
-                        });
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if let Some(addr) = peer.preferred_addr() {
-                                if ui.button("🔗 一鍵連線 (信任指紋)").clicked() {
-                                    self.draft_config.role = AppRole::Client;
-                                    self.draft_config.connect_address = addr.clone();
-                                    self.manual_connect_addr = addr.clone();
-                                    self.engine.send(EngineCommand::ConnectToPeer {
-                                        addr: addr.clone(),
-                                        expected_fingerprint: Some(peer.fingerprint.clone()),
-                                    });
-                                    self.status_banner = Some(format!(
-                                        "已信任指紋並連線至 {} ({addr})",
-                                        peer.hostname
-                                    ));
-                                }
-                            }
-                        });
+                    ui.horizontal(|ui| {
+                        if ui.button("🔄 重新掃描藍牙").clicked() {
+                            self.engine.send(EngineCommand::RefreshBluetooth);
+                            self.status_banner = Some("已重新整理藍牙設備清單".into());
+                        }
+                        if ui.button("⚙ 開啟系統藍牙設定").clicked() {
+                            self.engine
+                                .send(EngineCommand::OpenSystemBluetoothSettings);
+                        }
                     });
                 });
-                ui.add_space(4.0);
+
+                ui.add_space(8.0);
+                ui.heading("手動藍牙主機連線 (Bluetooth IP / Host)");
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut self.manual_bluetooth_addr);
+                    if ui.button("🔗 透過藍牙連線").clicked() {
+                        let target = self.manual_bluetooth_addr.trim().to_string();
+                        if !target.is_empty() {
+                            let target_addr = if target.contains(':') {
+                                target.clone()
+                            } else {
+                                format!("{}:{}", target, self.draft_config.listen_port)
+                            };
+                            self.draft_config.role = AppRole::Client;
+                            self.draft_config.transport_mode =
+                                ConnectionTransportMode::Bluetooth;
+                            self.draft_config.bluetooth_target_addr = target_addr.clone();
+                            self.engine.send(EngineCommand::ConnectViaBluetooth {
+                                addr: target_addr.clone(),
+                                expected_fingerprint: None,
+                            });
+                            self.status_banner =
+                                Some(format!("正在透過藍牙連線至 {target_addr}"));
+                        }
+                    }
+                });
+
+                ui.add_space(10.0);
+                ui.heading("已配對之電腦主機清單");
+                if snap.paired_bluetooth_hosts.is_empty() {
+                    ui.label(
+                        RichText::new(
+                            "尚未在系統中找到已配對的電腦主機。請在作業系統設定中將兩台電腦進行藍牙配對並開啟網路共用。",
+                        )
+                        .weak(),
+                    );
+                } else {
+                    for dev in &snap.paired_bluetooth_hosts {
+                        egui::Frame::group(ui.style()).show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.vertical(|ui| {
+                                    ui.label(RichText::new(&dev.name).strong());
+                                    let ip_text = dev
+                                        .last_seen_ip
+                                        .as_deref()
+                                        .unwrap_or("未分配 PAN IP (請開啟藍牙個人區域網路共用)");
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "MAC: {}  •  {}",
+                                            dev.mac, ip_text
+                                        ))
+                                        .small()
+                                        .weak(),
+                                    );
+                                });
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if let Some(ref ip) = dev.last_seen_ip {
+                                            let target_addr = format!(
+                                                "{}:{}",
+                                                ip, self.draft_config.listen_port
+                                            );
+                                            if ui.button("🔗 一鍵藍牙連線").clicked() {
+                                                self.draft_config.role = AppRole::Client;
+                                                self.draft_config.transport_mode =
+                                                    ConnectionTransportMode::Bluetooth;
+                                                self.draft_config.bluetooth_target_addr =
+                                                    target_addr.clone();
+                                                self.manual_bluetooth_addr =
+                                                    target_addr.clone();
+                                                self.engine.send(
+                                                    EngineCommand::ConnectViaBluetooth {
+                                                        addr: target_addr.clone(),
+                                                        expected_fingerprint: None,
+                                                    },
+                                                );
+                                                self.status_banner = Some(format!(
+                                                    "正在連線至藍牙主機 {} ({target_addr})",
+                                                    dev.name
+                                                ));
+                                            }
+                                        } else {
+                                            if ui.small_button("設定連線此主機").clicked() {
+                                                self.manual_bluetooth_addr = format!(
+                                                    "169.254.238.49:{}",
+                                                    self.draft_config.listen_port
+                                                );
+                                            }
+                                        }
+                                    },
+                                );
+                            });
+                        });
+                        ui.add_space(4.0);
+                    }
+                }
             }
         }
     }
@@ -1015,6 +1363,25 @@ impl MouseRoamingGui {
                 );
             });
 
+            ui.horizontal(|ui| {
+                ui.label("連線傳輸媒介:");
+                ui.radio_value(
+                    &mut self.draft_config.transport_mode,
+                    ConnectionTransportMode::Lan,
+                    ConnectionTransportMode::Lan.label(),
+                );
+                ui.radio_value(
+                    &mut self.draft_config.transport_mode,
+                    ConnectionTransportMode::Bluetooth,
+                    ConnectionTransportMode::Bluetooth.label(),
+                );
+                ui.radio_value(
+                    &mut self.draft_config.transport_mode,
+                    ConnectionTransportMode::Auto,
+                    ConnectionTransportMode::Auto.label(),
+                );
+            });
+
             egui::Grid::new("settings_grid")
                 .num_columns(2)
                 .spacing([12.0, 8.0])
@@ -1030,8 +1397,12 @@ impl MouseRoamingGui {
                     );
                     ui.end_row();
 
-                    ui.label("Client 連線目標 (IP:Port):");
+                    ui.label("Client 連線目標 (LAN IP:Port):");
                     ui.text_edit_singleline(&mut self.draft_config.connect_address);
+                    ui.end_row();
+
+                    ui.label("藍牙連線目標 (BT IP:Port):");
+                    ui.text_edit_singleline(&mut self.draft_config.bluetooth_target_addr);
                     ui.end_row();
 
                     ui.label("選填配對碼 (Pairing Token):");
@@ -1088,6 +1459,60 @@ impl MouseRoamingGui {
                 );
             });
 
+            ui.add_space(10.0);
+            ui.separator();
+            ui.heading("🔒 連線安全與通知設定");
+            ui.add_space(4.0);
+
+            ui.checkbox(
+                &mut self.draft_config.require_connection_approval,
+                "連線需要被允許 (連線審核：新裝置嘗試連線時彈出通知並等待本機核准)",
+            );
+            ui.checkbox(
+                &mut self.draft_config.notify_on_connection,
+                "啟用連線通知與提示音 (新連線請求、連線成功、斷線時發送桌面通知與提示音)",
+            );
+
+            ui.add_space(6.0);
+            ui.label(RichText::new("已永久信任／允許連線的裝置清單:").strong());
+            if self.draft_config.allowed_peers.is_empty() {
+                ui.label(
+                    RichText::new("（目前尚無已儲存的信任裝置。於收到連線請求時點選「允許並永久信任此裝置」即可加入清單）")
+                        .small()
+                        .weak(),
+                );
+            } else {
+                egui::Frame::group(ui.style()).show(ui, |ui| {
+                    let mut to_remove = Vec::new();
+                    for (pid, name) in &self.draft_config.allowed_peers {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new(name).strong());
+                            ui.label(RichText::new(format!("(ID: {pid})")).small().weak());
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("🗑 撤銷允許").clicked() {
+                                    to_remove.push(pid.clone());
+                                }
+                            });
+                        });
+                    }
+                    for pid in to_remove {
+                        self.draft_config.allowed_peers.remove(&pid);
+                        self.engine.send(EngineCommand::RevokeAllowedPeer(pid));
+                        self.status_banner = Some("已撤銷該裝置的連線允許許可".into());
+                    }
+                    if !self.draft_config.allowed_peers.is_empty() {
+                        ui.add_space(4.0);
+                        if ui.button("全部清除信任裝置").clicked() {
+                            for pid in self.draft_config.allowed_peers.keys().cloned().collect::<Vec<_>>() {
+                                self.engine.send(EngineCommand::RevokeAllowedPeer(pid));
+                            }
+                            self.draft_config.allowed_peers.clear();
+                            self.status_banner = Some("已清除所有已信任裝置".into());
+                        }
+                    }
+                });
+            }
+
             ui.add_space(12.0);
             ui.horizontal(|ui| {
                 if ui
@@ -1100,6 +1525,7 @@ impl MouseRoamingGui {
                     .clicked()
                 {
                     self.manual_connect_addr = self.draft_config.connect_address.clone();
+                    self.manual_bluetooth_addr = self.draft_config.bluetooth_target_addr.clone();
                     self.engine
                         .send(EngineCommand::UpdateConfig(self.draft_config.clone()));
                     self.status_banner = Some("設定已儲存並即時套用！".into());

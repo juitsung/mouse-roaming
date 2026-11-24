@@ -159,6 +159,7 @@ pub trait OsBackend: Send + Sync {
     fn injector(&self) -> Arc<dyn InputInjector>;
     fn clipboard(&self) -> Arc<dyn ClipboardProvider>;
     fn set_cursor_visible(&self, _visible: bool) {}
+    fn notify(&self, _title: &str, _message: &str) {}
     fn start_capture(
         &self,
         control: Arc<CaptureControl>,

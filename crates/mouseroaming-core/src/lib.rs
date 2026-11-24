@@ -4,6 +4,9 @@ pub mod engine;
 pub mod router;
 
 pub use clipboard_sync::ClipboardSync;
-pub use config::{AppConfig, AppRole};
-pub use engine::{ConnectedPeerInfo, EngineCommand, EngineHandle, EngineSnapshot, MouseRoamingEngine};
+pub use config::{AppConfig, AppRole, ConnectionTransportMode};
+pub use engine::{
+    BluetoothAdapterInfo, BluetoothHostDevice, ConnectedPeerInfo, EngineCommand, EngineHandle,
+    EngineSnapshot, MouseRoamingEngine, PendingConnection,
+};
 pub use router::EdgeRouter;
