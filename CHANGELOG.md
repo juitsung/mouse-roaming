@@ -28,6 +28,9 @@
   - **Windows 執行檔資源**：透過 `build.rs` 將 multi-resolution `assets/icon.ico` 編譯至執行檔資源中，於檔案總管與工作列完整呈現。
   - **視窗與工作列識別**：主視窗標題列與頂部導覽列即時載入 `assets/icon.png` 紋理。
   - **系統匣／選單列**：系統匣載入專用 32×32 透明背景圖示 `assets/icon_32.png`。
+- **啟動時不顯示 Console 視窗 (Silent GUI Startup without Console Window)**：
+  - 設定 Windows GUI 子系統 (`#![windows_subsystem = "windows"]`)，使用者點選執行檔、捷徑或登入自動啟動時，完全不跳出黑色 Console 命令提示字元視窗。
+  - 同時兼顧命令列調試模式，若從終端以 `--help` 或 `--headless` 啟動時自動透過 Win32 `AttachConsole` 附加輸出，兼具無縫圖形介面與 CLI 彈性。
 - **縮小時常駐背景 (Minimize to Background / System Tray & Menu Bar)**：
   - **Windows 系統匣常駐 (System Tray)**：點選視窗最小化按鈕 `_`、關閉按鈕 `[X]` 或頂部「🗕 縮小常駐」按鈕時，視窗立即自工作列隱藏，於背景低資源持續運作並常駐系統匣。
   - **macOS 選單列常駐 (Menu Bar)**：點擊最小化或關閉時隱藏主視窗，並於頂部 Menu Bar 保持常駐服務。

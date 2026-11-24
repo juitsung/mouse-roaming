@@ -1,3 +1,5 @@
+#![windows_subsystem = "windows"]
+
 mod gui;
 mod os_icons;
 mod tray;
@@ -53,6 +55,15 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    #[cfg(target_os = "windows")]
+    unsafe {
+        // If launched from an existing terminal, attach to parent console so CLI flags work
+        extern "system" {
+            fn AttachConsole(dwProcessId: u32) -> i32;
+        }
+        AttachConsole(u32::MAX);
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
